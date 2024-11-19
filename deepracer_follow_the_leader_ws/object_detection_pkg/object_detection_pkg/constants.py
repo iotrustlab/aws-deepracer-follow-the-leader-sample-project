@@ -114,7 +114,7 @@ COCO_LABELS = {
 }
 
 # Can be changed to detect any of the above LABELS based on use case.
-DETECT_CLASS = "person"
+DETECT_CLASS = "stop sign"
 
 # Confidence threshold for the object detector.
 CONFIDENCE_THRESHOLD = 0.4
@@ -125,3 +125,4 @@ MODEL_BIN = "/opt/models/frozen_inference_graph.bin"
 
 # Run inference on CPU instead of MYRIAD by default.
 DEVICE = "CPU"
+MODEL_TFLITE = "/home/deepracer/pycoral/test_data/ssd_mobilenet_v2_coco_quant_no_nms_edgetpu.tflite"
