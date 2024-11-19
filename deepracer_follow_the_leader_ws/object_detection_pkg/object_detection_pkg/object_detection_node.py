@@ -37,6 +37,7 @@ import threading
 import cv2
 import numpy as np
 import rclpy
+import os
 from rclpy.node import Node
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.qos import (QoSProfile,
@@ -45,13 +46,13 @@ from rclpy.qos import (QoSProfile,
 from cv_bridge import CvBridge
 from sensor_msgs.msg import Image
 
-from deepracer_interfaces_pkg.msg import (EvoSensorMsg,
-                                          DetectionDeltaMsg)
-from openvino.inference_engine import IECore
-import ngraph as ng
+from deepracer_interfaces_pkg.msg import (EvoSensorMsg,DetectionDeltaMsg)
+# pycoral packages:
+from pycoral.adapters import common, detect
+from pycoral.utils.edgetpu import make_interpreter
+
 from object_detection_pkg import (constants,
                                   utils)
-
 
 class ObjectDetectionNode(Node):
     """Node responsible for collecting sensor data (camera images) from sensor_fusion_pkg
@@ -67,7 +68,7 @@ class ObjectDetectionNode(Node):
 
         # Double buffer to hold the input images for inference.
         self.input_buffer = utils.DoubleBuffer(clear_data_on_get=True)
-        # Get DEVICE parameter (CPU/MYRIAD) from launch file.
+        # Get DEVICE parameter (CPU/TPU) from launch file.
         self.declare_parameter("DEVICE")
         self.device = self.get_parameter("DEVICE").get_parameter_value().string_value
         if not self.device:
@@ -77,10 +78,10 @@ class ObjectDetectionNode(Node):
         self.publish_display_output = \
             self.get_parameter("PUBLISH_DISPLAY_OUTPUT").get_parameter_value().bool_value
         self.get_logger().info(f"Publish output set to {self.publish_display_output}")
-        # Initialize Intel Inference Engine
+        # Initialize Coral TPU
         self.init_network()
         # Calculate target position for bounding box center.
-        self.target_x, self.target_y = self.calculate_target_center(self.w, self.h)
+        self.target_x, self.target_y = self.calculate_target_center(self.input_width, self.input_height)
 
         # Create subscription to sensor messages from camera.
         self.image_subscriber = self.create_subscription(EvoSensorMsg,
@@ -109,40 +110,21 @@ class ObjectDetectionNode(Node):
         self.get_logger().info(f"Waiting for input images on {constants.SENSOR_FUSION_TOPIC}")
 
     def init_network(self):
-        """Function which initializes Intel Inference Engine.
-        """
-        # Load OpenVINO Inference Engine.
+        """Function which initializes Coral TPU."""
         self.get_logger().info(f"Loading Inference Engine on {self.device}")
-        self.ie = IECore()
 
-        # Read and load the network.
-        self.net = self.ie.read_network(model=constants.MODEL_XML, weights=constants.MODEL_BIN)
-        self.func = ng.function_from_cnn(self.net)
-        self.ops = self.func.get_ordered_ops()
-        self.exec_net = self.ie.load_network(network=self.net, device_name=self.device)
-
-        # Read expected input image info from network and prepare input blobs.
-        # n: batch size, c: no. of channels, h: input height, w: input width
-        for self.input_key in self.net.input_info:
-            self.input_name = self.input_key
-            self.n, self.c, self.h, self.w = self.net.input_info[self.input_key].input_data.shape
-        # Initializing to float for optimizing in later functions
-        self.h = float(self.h)
-        self.w = float(self.w)
-
-        # Prepare output blobs
-        self.out_blob = next(iter(self.net.outputs))
+        self.interpreter = make_interpreter(constants.MODEL_TFLITE)
+        self.interpreter.allocate_tensors()
+        _, self.input_height, self.input_width, _ = self.interpreter.get_input_details()[0]['shape']
 
     def wait_for_thread(self):
-        """Function which joins the created background thread.
-        """
+        """Function which joins the created background thread."""
         if self.thread_initialized:
             self.thread.join()
             self.get_logger().info("Thread joined")
 
     def thread_shutdown(self):
-        """Function which sets the flag to shutdown background thread.
-        """
+        """Function which sets the flag to shutdown background thread."""
         self.stop_thread = True
 
     def on_image_received_cb(self, sensor_data):
@@ -161,19 +143,14 @@ class ObjectDetectionNode(Node):
             sensor_data (EvoSensorMsg): Contains sensor images and lidar data.
 
         Returns:
-            image: Preprosessed image expected by the network.
+            image: Preprocessed image expected by the network.
         """
         image = self.bridge.imgmsg_to_cv2(sensor_data.images[0])
-        ih, iw = image.shape[:-1]
-        # Resize to required input size
-        if (ih, iw) != (int(self.h), int(self.w)):
-            image = cv2.resize(image, (int(self.w), int(self.h)))
-        # Change data layout from HWC to CHW.
-        image = image.transpose((2, 0, 1))
+        image = cv2.resize(image, (self.input_width, self.input_height))
         return image
 
     def calculate_target_center(self, image_width, image_height):
-        """Method that calculates the target center's x and y co-ordinates for
+        """Method that calculates the target center's x and y coordinates for
            bounding box to be used as reference.
 
         Args:
@@ -189,7 +166,7 @@ class ObjectDetectionNode(Node):
         return target_x, target_y
 
     def calculate_bb_center(self, top_left_x, top_left_y, bottom_right_x, bottom_right_y):
-        """Method that calculates the bounding box center's x and y co-ordinates
+        """Method that calculates the bounding box center's x and y coordinates
            representing the detected object.
 
         Args:
@@ -212,25 +189,24 @@ class ObjectDetectionNode(Node):
            with respect to x and y axes.
 
         Args:
-            target_x (float): Target x co-ordinate.
-            target_y (float): Target y co-ordinate.
-            bb_center_x (float): x co-ordinate of center of detected bounding box.
-            bb_center_y (float): y co-ordinate of center of detected bounding box.
+            target_x (float): Target x coordinate.
+            target_y (float): Target y coordinate.
+            bb_center_x (float): x coordinate of center of detected bounding box.
+            bb_center_y (float): y coordinate of center of detected bounding box.
 
         Returns:
             delta (DetectionDeltaMsg): Normalized Error (delta) in x and y respectively
             returned as a list of floats and converted to ObjectDetectionErrorMsg.
         """
-        delta_x = (bb_center_x - target_x) / self.w
-        delta_y = (bb_center_y - target_y) / self.h
+        delta_x = (bb_center_x - target_x) / self.input_width
+        delta_y = (bb_center_y - target_y) / self.input_height
         delta = DetectionDeltaMsg()
         delta.delta = [delta_x, delta_y]
         self.get_logger().debug(f"Delta from target position: {delta_x} {delta_y}")
         return delta
 
     def run_inference(self):
-        """Method for running inference on received input image.
-        """
+        """Method for running inference on received input image."""
 
         try:
             while not self.stop_thread:
@@ -239,91 +215,64 @@ class ObjectDetectionNode(Node):
                 start_time = time.time()
 
                 # Pre-process input.
-                input_data = {}
-                input_data[self.input_name] = self.preprocess(sensor_data)
+                input_image = self.preprocess(sensor_data)
+                common.set_input(self.interpreter, input_image)
 
                 # Perform Inference.
-                res = self.exec_net.infer(inputs=input_data)
+                self.interpreter.invoke()
 
                 # Read and postprocess output.
-                res = res[self.out_blob]
-                boxes, classes = {}, {}
-                output_data = res[0][0]
+                objs = detect.get_objects(self.interpreter, constants.CONFIDENCE_THRESHOLD)
+                # Sort the objects by their confidence score in descending order.
+                objs_sorted = sorted(objs, key=lambda x: x.score, reverse=True)
+                # Print the top N inferences (e.g., top 3).
+                top_n = 3
+                for i, obj in enumerate(objs_sorted[:top_n]):
+                    self.get_logger().info(f"Top {i+1} inference: {constants.COCO_LABELS[obj.id]} with confidence {obj.score}")
+                
                 detected = False
-                for number, proposal in enumerate(output_data):
-                    # confidence for the predicted class.
-                    confidence = proposal[2]
-                    if (confidence > constants.CONFIDENCE_THRESHOLD and
-                            constants.COCO_LABELS[proposal[1]] == constants.DETECT_CLASS):
-                        # ID of the image in the batch.
-                        imid = np.int(proposal[0])
-                        # predicted class ID.
-                        label = np.int(proposal[1])
-                        # coordinates of the top left bounding box corner.
-                        # (coordinates are in normalized format, in range [0, 1])
-                        top_left_x = np.int(self.w * proposal[3])
-                        top_left_y = np.int(self.h * proposal[4])
-                        # coordinates of the bottom right bounding box corner.
-                        # (coordinates are in normalized format, in range [0, 1])
-                        bottom_right_x = np.int(self.w * proposal[5])
-                        bottom_right_y = np.int(self.h * proposal[6])
-                        # Calculate bounding box center
-                        bb_center_x, bb_center_y = self.calculate_bb_center(top_left_x,
-                                                                            top_left_y,
-                                                                            bottom_right_x,
-                                                                            bottom_right_y)
-                        # Calculate detection delta.
-                        detection_delta = self.calculate_delta(self.target_x,
-                                                               self.target_y,
-                                                               bb_center_x,
-                                                               bb_center_y)
-                        # Publish to object_detection_delta topic.
+                for obj in objs:
+                    if constants.COCO_LABELS[obj.id] == constants.DETECT_CLASS:
+                        bbox = obj.bbox
+                        bb_center_x, bb_center_y = self.calculate_bb_center(bbox.xmin, bbox.ymin, bbox.xmax, bbox.ymax)
+                        detection_delta = self.calculate_delta(self.target_x, self.target_y, bb_center_x, bb_center_y)
                         self.delta_publisher.publish(detection_delta)
-                        # Set the flag that there is a detected object.
                         detected = True
-
-                        if imid not in boxes.keys():
-                            boxes[imid] = []
-                        boxes[imid].append([top_left_x, top_left_y, bottom_right_x, bottom_right_y])
-                        if imid not in classes.keys():
-                            classes[imid] = []
-                        classes[imid].append(label)
-                        # Break as soon as specified class is detected.
                         break
 
                 if not detected:
-                    # Assume being at target position.
-                    detection_delta = self.calculate_delta(self.target_x,
-                                                           self.target_y,
-                                                           self.target_x,
-                                                           self.target_y)
+                    detection_delta = self.calculate_delta(self.target_x, self.target_y, self.target_x, self.target_y)
                     self.delta_publisher.publish(detection_delta)
 
                 if self.publish_display_output:
-                    # Change data layout from CHW to HWC.
-                    display_image = input_data[self.input_name].transpose((1, 2, 0))
-                    for imid in classes:
-                        for box in boxes[imid]:
-                            # Drawing bounding boxes on the image.
-                            cv2.rectangle(display_image,
-                                          (box[0], box[1]),
-                                          (box[2], box[3]),
-                                          (232, 35, 244),
-                                          2)
-                    # Printing target center on the image.
-                    cv2.circle(display_image,
-                               (int(self.target_x),
-                                int(self.target_y)),
-                               5,
-                               (0, 255, 0),
-                               -1)
-                    # Publish to display topic (Can be viewed on localhost:8080).
-                    display_image = self.bridge.cv2_to_imgmsg(np.array(display_image), "bgr8")
-                    self.display_image_publisher.publish(display_image)
+                    display_image = input_image
+
+                    for obj in objs_sorted:
+                        bbox = obj.bbox
+                        label = constants.COCO_LABELS[obj.id]
+                        confidence = obj.score
+                        label_text = f"{label}: {confidence:.2f}"
+
+                        # Draw bounding box
+                        cv2.rectangle(display_image, (bbox.xmin, bbox.ymin), (bbox.xmax, bbox.ymax), (232, 35, 244), 2)
+
+                        # Draw label
+                        label_size, base_line = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                        top = max(bbox.ymin, label_size[1])
+                        cv2.rectangle(display_image, (bbox.xmin, top - label_size[1]), (bbox.xmin + label_size[0], top + base_line), (255, 255, 255), cv2.FILLED)
+                        cv2.putText(display_image, label_text, (bbox.xmin, top), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+
+                    cv2.circle(display_image, (int(self.target_x), int(self.target_y)), 5, (0, 255, 0), -1)
+                    display_image_msg = self.bridge.cv2_to_imgmsg(np.array(display_image), "bgr8")
+                    self.display_image_publisher.publish(display_image_msg)
+
+                    # Save the image with bounding boxes to the output directory
+                    output_path = os.path.join("/home/deepracer", "detected_objects.jpg")
+                    cv2.imwrite(output_path, display_image)
+                    self.get_logger().info(f"Saved image with bounding boxes to {output_path}")    
                 self.get_logger().info(f"Total execution time = {time.time() - start_time}")
         except Exception as ex:
             self.get_logger().error(f"Failed inference step: {ex}")
-            # Destroy the ROS Node running in another thread as well.
             self.destroy_node()
             rclpy.shutdown()
 
