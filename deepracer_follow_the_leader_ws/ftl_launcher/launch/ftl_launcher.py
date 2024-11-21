@@ -105,7 +105,7 @@ def generate_launch_description():
         executable='inference_node',
         name='inference_node'
     )
-    model_optimizer_node = Node(
+    '''model_optimizer_node = Node(
         package='model_optimizer_pkg',
         namespace='model_optimizer_pkg',
         executable='model_optimizer_node',
@@ -123,7 +123,7 @@ def generate_launch_description():
                 'inverted': False,
                 'angle_compensate': True,
             }]
-    )
+    )'''
     sensor_fusion_node = Node(
         package='sensor_fusion_pkg',
         namespace='sensor_fusion_pkg',
@@ -166,15 +166,15 @@ def generate_launch_description():
     ld.add_action(ctrl_node)
     ld.add_action(deepracer_navigation_node)
     ld.add_action(software_update_node)
-    ld.add_action(model_loader_node)
+    #ld.add_action(model_loader_node)
     ld.add_action(otg_control_node)
     ld.add_action(network_monitor_node)
     ld.add_action(deepracer_systems_scripts_node)
     ld.add_action(device_info_node)
     ld.add_action(battery_node)
-    ld.add_action(inference_node)
-    ld.add_action(model_optimizer_node)
-    ld.add_action(rplidar_node)
+    #ld.add_action(inference_node)
+    #ld.add_action(model_optimizer_node)
+    #ld.add_action(rplidar_node)
     ld.add_action(sensor_fusion_node)
     ld.add_action(servo_node)
     ld.add_action(status_led_node)
