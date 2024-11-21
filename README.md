@@ -1,4 +1,4 @@
-# AWS DeepRacer Follow the Leader (FTL) sample project
+# AWS DeepRacer Follow the Leader (FTL) sample project (with Coral TPU)
 
 <p align="center">
 <img src="/media/deepracer_circle_sticker.png" width="250" height="250" >
